@@ -1,0 +1,5 @@
+vpn-configs/
+*.ovpn
+*.pem
+*-info.txt
+wifi-networks.json
