@@ -15,6 +15,7 @@ Devices → GL-MT300N-V2 → Home WiFi → Internet (via VPN)
 ## Workflow
 
 Important:
+- **The router must be configured in Repeater mode** to connect to your home WiFi and route traffic through the VPN
 - Every command that goes to the router, requires previous login
 - Every command that goes to AWS requires AWS credentials configured in the AWS CLI (not managed by this script)
 - The `configure-vpn-client` and `start-vpn-client` commands automatically update the AWS security group to allow your current public IP. Old IPs are removed to keep the security group clean.
@@ -280,11 +281,16 @@ The router's upload endpoint requires specific parameters:
 - CloudFormation stack creation takes 3-5 minutes
 
 ## Verification
-```bash
-./test-vpn.sh
-```
 
-Should show your VPN exit IP, not your home IP.
+Check your public IP to verify VPN is working:
+
+```bash
+# Without VPN - shows your home IP
+curl https://api.ipify.org
+
+# With VPN active - shows AWS region IP
+curl https://api.ipify.org
+```
 
 ## Cost Optimization
 - Stop instance when not in use: `./glinet.sh stop-aws-openvpn --region <region>`
