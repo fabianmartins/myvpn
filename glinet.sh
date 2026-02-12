@@ -36,7 +36,7 @@ ensure_security_group_access() {
     --group-ids "$SG_ID" \
     --region "$REGION" \
     --query "SecurityGroups[0].IpPermissions[?FromPort==\`1194\`].IpRanges[?CidrIp==\`$MY_IP/32\`]" \
-    --output text 2>/dev/null)
+    --output text 2>/dev/null || echo "")
   
   if [ -n "$HAS_ACCESS" ]; then
     return
@@ -49,7 +49,7 @@ ensure_security_group_access() {
     --group-ids "$SG_ID" \
     --region "$REGION" \
     --query "SecurityGroups[0].IpPermissions[?FromPort==\`1194\` && ToPort==\`1194\` && IpProtocol==\`udp\`].IpRanges[].CidrIp" \
-    --output text 2>/dev/null)
+    --output text 2>/dev/null || echo "")
   
   for OLD_IP in $OLD_IPS; do
     if [ "$OLD_IP" != "$MY_IP/32" ]; then
@@ -201,10 +201,11 @@ cmd_configure_vpn_client() {
     exit 1
   fi
   
-  REGION=$(basename "$OVPN_FILE" | sed 's/aws-vpn-.*-\(.*\)\.ovpn/\1/')
-  ACCOUNT_ID=$(basename "$OVPN_FILE" | sed 's/aws-vpn-\(.*\)-.*\.ovpn/\1/')
-  CLIENT_NAME="aws-vpn-$ACCOUNT_ID-$REGION"
   FILENAME=$(basename "$OVPN_FILE")
+  # Extract account-id and region from filename: aws-vpn-<account-id>-<region>.ovpn
+  ACCOUNT_ID=$(echo "$FILENAME" | sed 's/aws-vpn-\([0-9]\{12\}\)-.*\.ovpn/\1/')
+  REGION=$(echo "$FILENAME" | sed 's/aws-vpn-[0-9]\{12\}-\(.*\)\.ovpn/\1/')
+  CLIENT_NAME="aws-vpn-$ACCOUNT_ID-$REGION"
   
   # Ensure security group allows current IP
   ensure_security_group_access "$REGION"
@@ -215,8 +216,9 @@ cmd_configure_vpn_client() {
   
   # Check if client already exists
   CONFIGS=$(router_api_call "ovpn-client" "get_all_config_list")
-  if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"$FILENAME\")" > /dev/null 2>&1; then
-    echo "ERROR: Client $FILENAME already exists. Delete it first."
+  CLIENT_EXISTS=$(echo "$CONFIGS" | jq -r ".result.config_list[].clients[]? | select(.name == \"$CLIENT_NAME\") | .name" 2>/dev/null || echo "")
+  if [ -n "$CLIENT_EXISTS" ]; then
+    echo "ERROR: Client $CLIENT_NAME already exists. Delete it first."
     exit 1
   fi
   
@@ -259,7 +261,8 @@ cmd_configure_vpn_client() {
     -F "path=/tmp/ovpn_upload/$FILENAME" \
     -F "file=@$OVPN_FILE;filename=$FILENAME" > /dev/null
   
-  sleep 5
+  echo "Waiting for file processing..."
+  sleep 10
   
   if [ -z "$GROUP_ID" ]; then
     echo "Creating group..."
@@ -288,7 +291,8 @@ cmd_configure_vpn_client() {
     -H "Cookie: sysauth=$SID" \
     -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["'$SID'","ovpn-client","check_config",{"filename":"'$FILENAME'","group_id":'$GROUP_ID'}]}')
   
-  if ! echo "$CHECK_RESULT" | jq -e ".result.passed[]? | select(. == \"$FILENAME\")" > /dev/null 2>&1; then
+  VALIDATION_OK=$(echo "$CHECK_RESULT" | jq -r ".result.passed[]? | select(. == \"$FILENAME\")" 2>/dev/null || echo "")
+  if [ -z "$VALIDATION_OK" ]; then
     echo "ERROR: Configuration validation failed"
     echo "$CHECK_RESULT" | jq '.result'
     exit 1
@@ -366,7 +370,8 @@ cmd_list_vpn_clients() {
     
     # Check router
     ROUTER_EXISTS="false"
-    if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"aws-vpn-$ACCOUNT_REGION\")" > /dev/null 2>&1; then
+    ROUTER_CHECK=$(echo "$CONFIGS" | jq -r ".result.config_list[].clients[]? | select(.name == \"aws-vpn-$ACCOUNT_REGION\") | .name" 2>/dev/null || echo "")
+    if [ -n "$ROUTER_CHECK" ]; then
       ROUTER_EXISTS="true"
     fi
     
@@ -505,13 +510,11 @@ cmd_start_vpn_client() {
     -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["'"$SID"'","ovpn-client","start",{"group_id":'"$GROUP_ID"',"client_id":'"$CLIENT_ID"'}]}')
   
   # Check for errors
-  if echo "$RESULT" | jq -e '.result.err_code' > /dev/null 2>&1; then
-    ERR_CODE=$(echo "$RESULT" | jq -r '.result.err_code')
-    ERR_MSG=$(echo "$RESULT" | jq -r '.result.err_msg')
-    if [ "$ERR_CODE" != "0" ] && [ "$ERR_CODE" != "null" ]; then
-      echo "ERROR: Failed to start VPN (code: $ERR_CODE, message: $ERR_MSG)"
-      exit 1
-    fi
+  ERR_CODE=$(echo "$RESULT" | jq -r '.result.err_code // empty' 2>/dev/null)
+  if [ -n "$ERR_CODE" ] && [ "$ERR_CODE" != "0" ] && [ "$ERR_CODE" != "null" ]; then
+    ERR_MSG=$(echo "$RESULT" | jq -r '.result.err_msg // empty')
+    echo "ERROR: Failed to start VPN (code: $ERR_CODE, message: $ERR_MSG)"
+    exit 1
   fi
   
   # Verify it started (wait up to 30 seconds)
@@ -790,6 +793,62 @@ cmd_destroy_aws_openvpn() {
   ./destroy-aws-openvpn.sh "$@"
 }
 
+# Command: update-aws-openvpn-ip
+cmd_update_aws_openvpn_ip() {
+  local REGION=""
+  
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --region) REGION="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  
+  if [ -z "$REGION" ]; then
+    echo "ERROR: --region required"
+    exit 1
+  fi
+  
+  echo "Updating OpenVPN configuration for region: $REGION"
+  
+  # Check if VPN is active for this region
+  STATUS=$(router_api_call "ovpn-client" "get_status")
+  VPN_STATUS=$(echo "$STATUS" | jq -r '.result.status')
+  ACCOUNT_ID=$(get_aws_account_id)
+  CLIENT_NAME="aws-vpn-$ACCOUNT_ID-$REGION"
+  
+  WAS_ACTIVE=false
+  if [ "$VPN_STATUS" = "1" ]; then
+    ACTIVE_NAME=$(echo "$STATUS" | jq -r '.result.name')
+    if [ "$ACTIVE_NAME" = "$CLIENT_NAME" ]; then
+      WAS_ACTIVE=true
+      echo "VPN is active, stopping..."
+      cmd_stop_vpn_client
+    fi
+  fi
+  
+  # Delete existing client configuration
+  echo "Removing old configuration..."
+  cmd_delete_vpn_client --region "$REGION" 2>/dev/null || true
+  
+  # Retrieve new configuration from AWS
+  echo "Downloading new configuration from AWS..."
+  cmd_retrieve_aws_openvpn --region "$REGION"
+  
+  # Configure the client with new config
+  OVPN_FILE="$VPN_DIR/aws-vpn-$ACCOUNT_ID-${REGION}.ovpn"
+  echo "Configuring router with new IP..."
+  cmd_configure_vpn_client --file "$OVPN_FILE"
+  
+  # Restart VPN if it was active
+  if [ "$WAS_ACTIVE" = true ]; then
+    echo "Restarting VPN..."
+    cmd_start_vpn_client --region "$REGION"
+  fi
+  
+  echo "✓ OpenVPN configuration updated successfully"
+}
+
 # Main
 COMMAND="${1:-}"
 shift || true
@@ -807,6 +866,7 @@ case "$COMMAND" in
   start-aws-openvpn) cmd_start_aws_openvpn "$@" ;;
   stop-aws-openvpn) cmd_stop_aws_openvpn "$@" ;;
   destroy-aws-openvpn) cmd_destroy_aws_openvpn "$@" ;;
+  update-aws-openvpn-ip) cmd_update_aws_openvpn_ip "$@" ;;
   *)
     echo "Usage: $0 <command> [options]"
     echo ""
@@ -823,6 +883,7 @@ case "$COMMAND" in
     echo "  start-aws-openvpn --region <region>"
     echo "  stop-aws-openvpn --region <region>"
     echo "  destroy-aws-openvpn --region <region>"
+    echo "  update-aws-openvpn-ip --region <region>"
     exit 1
     ;;
 esac
