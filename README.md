@@ -115,7 +115,26 @@ glinet.sh start-aws-openvpn --region <region>
 
 This command starts the back-end server for this region, if it is stopped.
 
-### 9. destroy the back-end OpenVPN server
+### 9. Update OpenVPN configuration after server restart
+
+When you stop and restart the AWS OpenVPN server, the public IP changes. This command automatically updates the router configuration with the new IP.
+
+The computer should be connected to the router.
+Requires a previous login in the router. 
+Requires AWS authentication.
+
+```bash
+glinet.sh update-aws-openvpn-ip --region <region>
+```
+
+This command:
+    1. Checks if VPN is active and stops it if needed
+    2. Removes old configuration from router
+    3. Downloads new configuration from AWS (with updated IP)
+    4. Reconfigures the router with new IP
+    5. Restarts VPN if it was active before
+
+### 10. destroy the back-end OpenVPN server
 
 The computer should be connected to the router.
 Requires a previous login in the router. 
@@ -235,6 +254,12 @@ Responses:
 ./glinet.sh stop-vpn-client
 ```
 
+#### Update IP After Server Restart
+If you stopped and restarted the AWS server, the IP changed. Update the router configuration:
+```bash
+./glinet.sh update-aws-openvpn-ip --region us-east-1
+```
+
 **Note:** If you get a "Session expired" error, login again:
 ```bash
 ./glinet.sh login --password <your-password>
@@ -299,8 +324,10 @@ curl https://api.ipify.org
 
 ## Troubleshooting
 - **Can't access router**: Ensure you're connected to router network
+- **Session expired**: Run `./glinet.sh login --password <password>` again
 - **VPN won't connect**: Check AWS security group allows UDP 1194 from your IP (automatically managed by script)
 - **VPN connects but no internet**: NAT rules may be missing on server. The script now uses `iptables-persistent` to prevent this
 - **Slow speeds**: Try different AWS region closer to you
 - **Router loses connection**: Disable VPN, reconnect to home WiFi, re-enable VPN
-- **IP changed**: Run `./glinet.sh start-vpn-client --region <region>` to update security group automatically
+- **IP changed after server restart**: Run `./glinet.sh update-aws-openvpn-ip --region <region>` to automatically update configuration
+- **Configuration validation failed**: Wait a few seconds and try again. The router needs time to process uploaded files
