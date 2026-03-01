@@ -20,13 +20,26 @@ ensure_security_group_access() {
     return
   fi
   
-  SG_ID=$(aws cloudformation describe-stacks \
+  # Get instance ID from CloudFormation
+  INSTANCE_ID=$(aws cloudformation describe-stacks \
     --stack-name "$STACK_NAME" \
     --region "$REGION" \
-    --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
+    --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
     --output text 2>/dev/null)
   
-  if [ -z "$SG_ID" ]; then
+  if [ -z "$INSTANCE_ID" ]; then
+    echo "WARNING: Could not find instance, skipping security group check"
+    return
+  fi
+  
+  # Get actual security group ID from the instance
+  SG_ID=$(aws ec2 describe-instances \
+    --instance-ids "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
+    --output text 2>/dev/null)
+  
+  if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
     echo "WARNING: Could not find security group, skipping check"
     return
   fi
@@ -201,24 +214,30 @@ cmd_configure_vpn_client() {
     exit 1
   fi
   
-  REGION=$(basename "$OVPN_FILE" | sed 's/aws-vpn-.*-\(.*\)\.ovpn/\1/')
-  ACCOUNT_ID=$(basename "$OVPN_FILE" | sed 's/aws-vpn-\(.*\)-.*\.ovpn/\1/')
+  if [ ! -f "$SESSION_FILE" ]; then
+    echo "ERROR: Not logged in to router. Run: $0 login --password <password>"
+    exit 1
+  fi
+  
+  REGION=$(basename "$OVPN_FILE" | sed 's/aws-vpn-[0-9]*-\(.*\)\.ovpn/\1/')
+  ACCOUNT_ID=$(basename "$OVPN_FILE" | sed 's/aws-vpn-\([0-9]*\)-.*\.ovpn/\1/')
   CLIENT_NAME="aws-vpn-$ACCOUNT_ID-$REGION"
   FILENAME=$(basename "$OVPN_FILE")
   
-  # Ensure security group allows current IP
-  ensure_security_group_access "$REGION"
-  
   echo "Configuring VPN client: $CLIENT_NAME"
+  
+  # Check if client already exists (this will also validate session)
+  CONFIGS=$(router_api_call "ovpn-client" "get_all_config_list")
+  
+  if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"$CLIENT_NAME\")" > /dev/null 2>&1; then
+    echo "ERROR: Client $CLIENT_NAME already exists. Delete it first."
+    exit 1
+  fi
   
   source "$SESSION_FILE"
   
-  # Check if client already exists
-  CONFIGS=$(router_api_call "ovpn-client" "get_all_config_list")
-  if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"$FILENAME\")" > /dev/null 2>&1; then
-    echo "ERROR: Client $FILENAME already exists. Delete it first."
-    exit 1
-  fi
+  # Ensure security group allows current IP
+  ensure_security_group_access "$REGION"
   
   # Find or create group
   GROUP_LIST=$(curl -s "http://$ROUTER_IP/rpc" \
@@ -343,7 +362,7 @@ cmd_list_vpn_clients() {
   # 2. Check local vpn-configs
   for ovpn_file in "$VPN_DIR"/aws-vpn-*.ovpn; do
     if [ -f "$ovpn_file" ]; then
-      REGION=$(basename "$ovpn_file" | sed 's/aws-vpn-.*-\(.*\)\.ovpn/\1/')
+      REGION=$(basename "$ovpn_file" | sed 's/aws-vpn-[0-9]*-\(.*\)\.ovpn/\1/')
       ACCOUNT_REGION=$(basename "$ovpn_file" | sed 's/aws-vpn-\(.*\)\.ovpn/\1/')
       if ! echo "$REGIONS_LIST" | grep -q "^${ACCOUNT_REGION}$"; then
         REGIONS_LIST="$REGIONS_LIST"$'\n'"$ACCOUNT_REGION"
@@ -624,7 +643,7 @@ cmd_retrieve_aws_openvpn() {
     --query 'Reservations[0].Instances[0].PublicIpAddress' \
     --output text)
   
-  sed -i '' "s/^remote .* 1194/remote $PUBLIC_IP 1194/" "$VPN_DIR/aws-vpn-$ACCOUNT_ID-${REGION}.ovpn"
+  sed -i "s/^remote .* 1194/remote $PUBLIC_IP 1194/" "$VPN_DIR/aws-vpn-$ACCOUNT_ID-${REGION}.ovpn"
   
   echo "✓ Config saved to: $VPN_DIR/aws-vpn-$ACCOUNT_ID-${REGION}.ovpn"
 }
