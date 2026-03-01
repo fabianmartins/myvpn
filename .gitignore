@@ -3,3 +3,6 @@ vpn-configs/
 *.pem
 *-info.txt
 wifi-networks.json
+.glinet-session
+.gitignore
+.vscode/settings.json
