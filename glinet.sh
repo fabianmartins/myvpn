@@ -14,6 +14,11 @@ ensure_security_group_access() {
   local REGION="$1"
   local STACK_NAME="glinet-openvpn"
   
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+  fi
+  
   MY_IP=$(curl -s https://api.ipify.org)
   if [ -z "$MY_IP" ]; then
     echo "WARNING: Could not detect public IP, skipping security group check"
@@ -717,6 +722,11 @@ cmd_create_aws_openvpn() {
   
   [[ -z "$REGION" ]] && { echo "Error: --region required"; exit 1; }
   
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+  fi
+  
   local STACK_NAME="glinet-openvpn"
   
   echo "Creating OpenVPN stack in $REGION..."
@@ -746,6 +756,11 @@ cmd_start_aws_openvpn() {
   done
   
   [[ -z "$REGION" ]] && { echo "Error: --region required"; exit 1; }
+  
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+  fi
   
   local STACK_NAME="glinet-openvpn"
   local INSTANCE_ID=$(aws cloudformation describe-stacks \
@@ -778,6 +793,11 @@ cmd_stop_aws_openvpn() {
   
   [[ -z "$REGION" ]] && { echo "Error: --region required"; exit 1; }
   
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+  fi
+  
   local STACK_NAME="glinet-openvpn"
   local INSTANCE_ID=$(aws cloudformation describe-stacks \
     --region "$REGION" \
@@ -801,6 +821,11 @@ cmd_destroy_aws_openvpn() {
       *) break ;;
     esac
   done
+  
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "ERROR: AWS credentials not configured. Run 'aws configure' first."
+    exit 1
+  fi
   
   if [ -n "$REGION" ]; then
     cmd_delete_vpn_client --region "$REGION" 2>/dev/null || true
