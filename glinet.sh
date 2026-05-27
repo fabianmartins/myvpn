@@ -235,8 +235,8 @@ cmd_configure_vpn_client() {
   CONFIGS=$(router_api_call "ovpn-client" "get_all_config_list")
   
   if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"$CLIENT_NAME\")" > /dev/null 2>&1; then
-    echo "ERROR: Client $CLIENT_NAME already exists. Delete it first."
-    exit 1
+    echo "✓ Client $CLIENT_NAME already configured on router. Skipping."
+    exit 0
   fi
   
   source "$SESSION_FILE"
@@ -746,6 +746,13 @@ cmd_create_aws_openvpn() {
   fi
   
   local STACK_NAME="glinet-openvpn"
+  
+  # Check if stack already exists
+  if aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" &>/dev/null; then
+    echo "✓ Stack $STACK_NAME already exists in $REGION. Skipping creation."
+    cmd_retrieve_aws_openvpn --region "$REGION"
+    return
+  fi
   
   echo "Creating OpenVPN stack in $REGION..."
   aws cloudformation create-stack \
