@@ -5,4 +5,4 @@ vpn-configs/
 wifi-networks.json
 .glinet-session
 .gitignore
-.vscode/settings.json
+.vscode
