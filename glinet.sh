@@ -402,13 +402,30 @@ cmd_list_vpn_clients() {
     
     # Check AWS
     AWS_EXISTS="false"
-    if aws cloudformation describe-stacks --stack-name glinet-openvpn --region "$REGION" &>/dev/null; then
+    AWS_IP=""
+    STACK_OUTPUT=$(aws cloudformation describe-stacks --stack-name glinet-openvpn --region "$REGION" 2>/dev/null)
+    if [ $? -eq 0 ]; then
       AWS_EXISTS="true"
+      INSTANCE_ID=$(echo "$STACK_OUTPUT" | jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="InstanceId") | .OutputValue')
+      if [ -n "$INSTANCE_ID" ]; then
+        AWS_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+          --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null)
+        [ "$AWS_IP" = "None" ] && AWS_IP=""
+      fi
+    fi
+    
+    # Check IP match
+    IP_MATCH="false"
+    if [ "$OVPN_EXISTS" = "true" ] && [ -n "$AWS_IP" ]; then
+      OVPN_IP=$(grep -oP '^remote \K[^ ]+' "$VPN_DIR/aws-vpn-${ACCOUNT_REGION}.ovpn" 2>/dev/null)
+      [ "$OVPN_IP" = "$AWS_IP" ] && IP_MATCH="true"
     fi
     
     # Determine status
-    if [ "$ROUTER_EXISTS" = "true" ] && [ "$OVPN_EXISTS" = "true" ] && [ "$AWS_EXISTS" = "true" ]; then
+    if [ "$ROUTER_EXISTS" = "true" ] && [ "$OVPN_EXISTS" = "true" ] && [ "$AWS_EXISTS" = "true" ] && [ "$IP_MATCH" = "true" ]; then
       STATUS="CONSISTENT"
+    elif [ "$ROUTER_EXISTS" = "true" ] && [ "$AWS_EXISTS" = "true" ] && [ "$IP_MATCH" = "false" ]; then
+      STATUS="STALE_IP"
     else
       STATUS="INCONSISTENT"
     fi
@@ -417,6 +434,7 @@ cmd_list_vpn_clients() {
     echo -n "\"router\": $ROUTER_EXISTS, "
     echo -n "\"ovpn-client\": $OVPN_EXISTS, "
     echo -n "\"aws-server\": $AWS_EXISTS, "
+    echo -n "\"ip-match\": $IP_MATCH, "
     echo -n "\"status\": \"$STATUS\""
     echo -n "}"
   done <<< "$REGIONS_LIST"
