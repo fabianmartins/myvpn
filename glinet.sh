@@ -859,11 +859,254 @@ cmd_destroy_aws_openvpn() {
   ./destroy-aws-openvpn.sh "$@"
 }
 
+# Command: start-vpn (orchestrated)
+cmd_start_vpn() {
+  local REGION="" PASSWORD="" PROFILE="" ROUTER_IP_OPT=""
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --region) REGION="$2"; shift 2 ;;
+      --router-pwd) PASSWORD="$2"; shift 2 ;;
+      --profile) PROFILE="$2"; shift 2 ;;
+      --router-ip) ROUTER_IP_OPT="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$REGION" ]] && { echo "ERROR: --region required"; exit 1; }
+  [[ -z "$PASSWORD" ]] && { echo "ERROR: --router-pwd required"; exit 1; }
+  [[ -n "$PROFILE" ]] && export AWS_PROFILE="$PROFILE"
+
+  # 1. Check AWS credentials
+  echo "① Checking AWS credentials..."
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "FAILURE: AWS credentials not valid."
+    exit 1
+  fi
+  ACCOUNT_ID=$(get_aws_account_id)
+  echo "  ✓ Account: $ACCOUNT_ID"
+
+  # 2. Login to router
+  echo "② Logging into router..."
+  local LOGIN_ARGS=(--password "$PASSWORD")
+  [[ -n "$ROUTER_IP_OPT" ]] && LOGIN_ARGS+=(--router-ip "$ROUTER_IP_OPT")
+  cmd_login "${LOGIN_ARGS[@]}" | tail -1
+
+  # 3. Check stack exists
+  echo "③ Checking CloudFormation stack..."
+  local STACK_NAME="glinet-openvpn"
+  local STACK_OUTPUT
+  STACK_OUTPUT=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" 2>&1) || {
+    echo "FAILURE: Stack $STACK_NAME not found in $REGION. Create it first with: $0 create-aws-openvpn --region $REGION"
+    exit 1
+  }
+  local INSTANCE_ID
+  INSTANCE_ID=$(echo "$STACK_OUTPUT" | jq -r '.Stacks[0].Outputs[] | select(.OutputKey=="InstanceId") | .OutputValue')
+  echo "  ✓ Stack exists, instance: $INSTANCE_ID"
+
+  # 4. Start instance if necessary
+  echo "④ Checking instance state..."
+  local STATE
+  STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)
+
+  if [ "$STATE" = "running" ]; then
+    echo "  ✓ Already running"
+  elif [ "$STATE" = "stopped" ]; then
+    echo "  Starting instance..."
+    aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
+    aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+    echo "  ✓ Instance started"
+  else
+    echo "FAILURE: Instance is in state '$STATE', cannot proceed."
+    exit 1
+  fi
+
+  # 5. Ensure security group allows current IP
+  echo "⑤ Checking security group..."
+  ensure_security_group_access "$REGION"
+  echo "  ✓ Security group OK"
+
+  # 6. Get current public IP of instance
+  local AWS_IP
+  AWS_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+  # 7. Download new client config if necessary
+  local CLIENT_NAME="aws-vpn-$ACCOUNT_ID-$REGION"
+  local OVPN_FILE="$VPN_DIR/aws-vpn-$ACCOUNT_ID-${REGION}.ovpn"
+  local NEED_NEW_CONFIG="false"
+
+  if [ ! -f "$OVPN_FILE" ]; then
+    NEED_NEW_CONFIG="true"
+  else
+    local OVPN_IP
+    OVPN_IP=$(grep -oP '^remote \K[^ ]+' "$OVPN_FILE" 2>/dev/null)
+    if [ "$OVPN_IP" != "$AWS_IP" ]; then
+      NEED_NEW_CONFIG="true"
+    fi
+  fi
+
+  if [ "$NEED_NEW_CONFIG" = "true" ]; then
+    echo "⑥ Retrieving new VPN config (IP: $AWS_IP)..."
+    # Wait for SSM agent to be ready
+    echo "  Waiting for SSM agent..."
+    for i in {1..30}; do
+      if aws ssm describe-instance-information --region "$REGION" \
+        --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+        --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null | grep -q "Online"; then
+        break
+      fi
+      sleep 2
+    done
+    cmd_retrieve_aws_openvpn --region "$REGION" | grep -v "^Retrieving\|^Downloading"
+  else
+    echo "⑥ Config already up-to-date (IP: $AWS_IP)"
+  fi
+
+  # 8. Update router client if necessary
+  echo "⑦ Checking router VPN client..."
+  local CONFIGS
+  CONFIGS=$(router_api_call "ovpn-client" "get_all_config_list")
+  local ROUTER_HAS_CLIENT="false"
+  local ROUTER_IP_MATCH="false"
+
+  if echo "$CONFIGS" | jq -e ".result.config_list[].clients[]? | select(.name == \"$CLIENT_NAME\")" > /dev/null 2>&1; then
+    ROUTER_HAS_CLIENT="true"
+    # Check if the router's configured remote matches current AWS IP
+    local ROUTER_DOMAIN
+    ROUTER_DOMAIN=$(echo "$CONFIGS" | jq -r ".result.config_list[] | select(.clients[]?.name == \"$CLIENT_NAME\") | .clients[] | select(.name == \"$CLIENT_NAME\") | .remote[0]? // empty")
+    # The router status shows domain field - check via get_status or just compare with what we know
+    # Safest: if we needed a new config, we need to reconfigure the router
+    if [ "$NEED_NEW_CONFIG" = "false" ]; then
+      ROUTER_IP_MATCH="true"
+    fi
+  fi
+
+  if [ "$ROUTER_HAS_CLIENT" = "true" ] && [ "$ROUTER_IP_MATCH" = "false" ]; then
+    echo "  Stale client on router, replacing..."
+    # Remove from router only (not local file)
+    source "$SESSION_FILE"
+    local GROUP_DATA_DEL GROUP_ID_DEL CLIENT_ID_DEL
+    GROUP_DATA_DEL=$(echo "$CONFIGS" | jq -r ".result.config_list[] | select(.clients[]?.name == \"$CLIENT_NAME\")")
+    GROUP_ID_DEL=$(echo "$GROUP_DATA_DEL" | jq -r '.group_id')
+    CLIENT_ID_DEL=$(echo "$GROUP_DATA_DEL" | jq -r ".clients[] | select(.name == \"$CLIENT_NAME\") | .client_id")
+    curl -s "http://$ROUTER_IP/rpc" -H "Content-Type: application/json" -H "Cookie: sysauth=$SID" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["'$SID'","ovpn-client","remove_config",{"group_id":'$GROUP_ID_DEL',"client_id":'$CLIENT_ID_DEL'}]}' > /dev/null
+    curl -s "http://$ROUTER_IP/rpc" -H "Content-Type: application/json" -H "Cookie: sysauth=$SID" \
+      -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["'$SID'","ovpn-client","remove_group",{"group_id":'$GROUP_ID_DEL'}]}' > /dev/null
+    echo "  ✓ Old client removed"
+    (cmd_configure_vpn_client --file "$OVPN_FILE") 2>&1 | sed 's/^/  /'
+  elif [ "$ROUTER_HAS_CLIENT" = "false" ]; then
+    echo "  Configuring new client on router..."
+    (cmd_configure_vpn_client --file "$OVPN_FILE") 2>&1 | sed 's/^/  /'
+  else
+    echo "  ✓ Router client is current"
+  fi
+
+  # 9. Start VPN
+  echo "⑧ Starting VPN..."
+  (cmd_start_vpn_client --region "$REGION") 2>&1 | sed 's/^/  /'
+
+  # 10. Verify and report
+  echo ""
+  echo "Verifying public IP..."
+  local CURRENT_IP=""
+  for i in {1..5}; do
+    CURRENT_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null) || true
+    [ -n "$CURRENT_IP" ] && break
+    sleep 2
+  done
+
+  if [ -n "$CURRENT_IP" ] && [ "$CURRENT_IP" = "$AWS_IP" ]; then
+    echo "SUCCESS ✓ VPN active via $REGION"
+    echo "Public IP: $CURRENT_IP"
+  elif [ -n "$CURRENT_IP" ]; then
+    echo "FAILURE ✗ VPN may not be routing traffic correctly"
+    echo "Expected IP: $AWS_IP"
+    echo "Actual IP: $CURRENT_IP"
+    exit 1
+  else
+    echo "WARNING: VPN started but could not verify public IP"
+  fi
+}
+
+# Command: stop-vpn (orchestrated)
+cmd_stop_vpn() {
+  local REGION="" PASSWORD="" PROFILE="" ROUTER_IP_OPT=""
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --region) REGION="$2"; shift 2 ;;
+      --router-pwd) PASSWORD="$2"; shift 2 ;;
+      --profile) PROFILE="$2"; shift 2 ;;
+      --router-ip) ROUTER_IP_OPT="$2"; shift 2 ;;
+      *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$REGION" ]] && { echo "ERROR: --region required"; exit 1; }
+  [[ -z "$PASSWORD" ]] && { echo "ERROR: --router-pwd required"; exit 1; }
+  [[ -n "$PROFILE" ]] && export AWS_PROFILE="$PROFILE"
+
+  # 1. Check AWS credentials
+  echo "① Checking AWS credentials..."
+  if ! aws sts get-caller-identity &>/dev/null; then
+    echo "FAILURE: AWS credentials not valid."
+    exit 1
+  fi
+  echo "  ✓ OK"
+
+  # 2. Login to router
+  echo "② Logging into router..."
+  local LOGIN_ARGS=(--password "$PASSWORD")
+  [[ -n "$ROUTER_IP_OPT" ]] && LOGIN_ARGS+=(--router-ip "$ROUTER_IP_OPT")
+  cmd_login "${LOGIN_ARGS[@]}" | tail -1
+
+  # 3. Stop VPN on router
+  echo "③ Stopping VPN on router..."
+  (cmd_stop_vpn_client) 2>&1 | sed 's/^/  /'
+
+  # Wait for network to recover after VPN disconnect
+  echo "  Waiting for network..."
+  for i in {1..15}; do
+    if curl -s --max-time 3 https://api.ipify.org &>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+
+  # 4. Stop EC2 instance
+  echo "④ Stopping EC2 instance..."
+  local STOP_OUTPUT
+  STOP_OUTPUT=$( (cmd_stop_aws_openvpn --region "$REGION") 2>&1) || true
+  echo "$STOP_OUTPUT" | sed 's/^/  /'
+  if echo "$STOP_OUTPUT" | grep -q "ERROR"; then
+    echo ""
+    echo "FAILURE ✗ Could not stop EC2 instance"
+    exit 1
+  fi
+
+  # 5. Verify and report
+  echo ""
+  local CURRENT_IP=""
+  CURRENT_IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null) || true
+
+  if [ -n "$CURRENT_IP" ]; then
+    echo "SUCCESS ✓ VPN stopped, instance stopped"
+    echo "Public IP: $CURRENT_IP"
+  else
+    echo "WARNING: VPN stopped but could not verify public IP"
+  fi
+}
+
 # Main
 COMMAND="${1:-}"
 shift || true
 
 case "$COMMAND" in
+  start-vpn) cmd_start_vpn "$@" ;;
+  stop-vpn) cmd_stop_vpn "$@" ;;
   login) cmd_login "$@" ;;
   list-vpn-clients) cmd_list_vpn_clients "$@" ;;
   get-vpn-status) cmd_get_vpn_status "$@" ;;
@@ -879,7 +1122,11 @@ case "$COMMAND" in
   *)
     echo "Usage: $0 <command> [options]"
     echo ""
-    echo "Commands:"
+    echo "High-level commands:"
+    echo "  start-vpn --region <region> --router-pwd <password> [--profile <aws-profile>] [--router-ip <ip>]"
+    echo "  stop-vpn --region <region> --router-pwd <password> [--profile <aws-profile>] [--router-ip <ip>]"
+    echo ""
+    echo "Low-level commands:"
     echo "  login --password <pass> [--router-ip <ip>]"
     echo "  list-vpn-clients"
     echo "  get-vpn-status"
